@@ -6,9 +6,10 @@
 #   "plotly>=5.18.0",
 #   "folium>=0.15.0",
 #   "requests>=2.31.0",
-#   "anthropic>=0.40.0",
+#   "google-generativeai>=0.8.0",
 #   "scikit-learn>=1.3.0",
 #   "numpy>=1.24.0",
+#   "python-dotenv>=1.0.0",
 # ]
 # ///
 
@@ -30,6 +31,13 @@ def __(mo):
     import math
     import os
     import re
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:  # pragma: no cover
+        pass
     import time
     import uuid
     from collections import defaultdict
@@ -46,14 +54,9 @@ def __(mo):
     from sklearn.metrics.pairwise import cosine_similarity
 
     try:
-        import anthropic
+        import google.generativeai as genai
     except Exception:  # pragma: no cover
-        anthropic = None
-
-    try:
-        from anthropic import APIStatusError as AnthropicAPIStatusError
-    except Exception:  # pragma: no cover
-        AnthropicAPIStatusError = Exception
+        genai = None
 
     MBTA = "https://api-v3.mbta.com"
     BUSY_ROUTES = ["1", "28", "39", "57", "66", "71", "73", "77"]
@@ -146,7 +149,7 @@ def __(mo):
         "data_error": "Some MBTA data could not be loaded. The dashboard will show partial results.",
         "narrator_title": "AI live briefing",
         "regenerate_ai": "Regenerate insight",
-        "no_api_key": "Set ANTHROPIC_API_KEY to enable Claude-powered narratives, chat, and policy auditing.",
+        "no_api_key": "Set GEMINI_API_KEY or GOOGLE_API_KEY in .env for Gemini-powered narratives, chat, and policy auditing.",
         "where_bus": "Where is my bus?",
         "active_buses": "Active buses",
         "pct_late": "Running late",
@@ -511,7 +514,8 @@ def __(mo):
                     "label": attr.get("label") or attr.get("status") or "",
                 }
             )
-        vdf = pd.DataFrame(rows)
+        _vcols = ["vehicle_id", "route_id", "trip_id", "lat", "lon", "delay_min", "status", "color", "label"]
+        vdf = pd.DataFrame(rows, columns=_vcols) if not rows else pd.DataFrame(rows)
         metrics["vehicles_df"] = vdf
         if len(vdf):
             known = vdf["delay_min"].notna()
@@ -639,7 +643,8 @@ def __(mo):
                 continue
             sid = s.get("id")
             sdf_rows.append({"id": sid, "lat": float(lat), "lon": float(lon), "name": attr.get("name") or ""})
-        sdf = pd.DataFrame(sdf_rows)
+        _scols = ["id", "lat", "lon", "name"]
+        sdf = pd.DataFrame(sdf_rows, columns=_scols) if not sdf_rows else pd.DataFrame(sdf_rows)
         if len(sdf) > 650:
             sdf = sdf.sample(650, random_state=7)
         sdf["has_pred"] = sdf["id"].isin(bus_stop_ids_pred)
@@ -795,29 +800,28 @@ def __(mo):
             "pct_late": float(metrics.get("pct_late", 0.0)),
         }
 
-    def anthropic_client():
-        key = os.environ.get("ANTHROPIC_API_KEY")
-        if not key or anthropic is None:
+    def gemini_client():
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not key or genai is None:
             return None
-        return anthropic.Anthropic(api_key=key)
+        genai.configure(api_key=key)
+        return True
 
-    def claude_text(client, system: str, user: str, max_tokens: int = 1200) -> str:
-        if client is None:
+    def gemini_text(_client: object, system: str, user: str, max_tokens: int = 1200) -> str:
+        if _client is None or genai is None:
             return ""
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
         try:
-            resp = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            parts: list[str] = []
-            for block in resp.content:
-                if getattr(block, "type", None) == "text":
-                    parts.append(block.text)
-            return "\n".join(parts).strip()
+            model = genai.GenerativeModel(model_name, system_instruction=system)
+            resp = model.generate_content(user, generation_config={"max_output_tokens": max_tokens})
+            if not resp.candidates:
+                return "(Gemini: no response candidates)"
+            try:
+                return (resp.text or "").strip()
+            except ValueError:
+                return f"(Gemini blocked or empty: {getattr(resp, 'prompt_feedback', '')})"
         except Exception as e:  # pragma: no cover
-            return f"(Claude error: {e})"
+            return f"(Gemini error: {e})"
 
     EQUITY = {
         "LANG_OPTIONS": LANG_OPTIONS,
@@ -827,8 +831,8 @@ def __(mo):
         "compute_metrics": compute_metrics,
         "retrieve_policy": retrieve_policy,
         "metrics_payload": metrics_payload,
-        "claude_text": claude_text,
-        "anthropic_client": anthropic_client,
+        "gemini_text": gemini_text,
+        "gemini_client": gemini_client,
         "POLICY_CHUNKS": POLICY_CHUNKS,
         "RIDERSHIP": RIDERSHIP,
         "NEIGHBOR_STATS": NEIGHBOR_STATS,
@@ -849,7 +853,6 @@ def __(mo, EQUITY):
     lang_dd = mo.ui.dropdown(options=EQUITY["LANG_OPTIONS"], value="English", label="Language / Idioma / 语言")
     # Cannot read lang_dd.value in this cell (same cell that defines lang_dd); label uses EN refresh string.
     refresh_btn = mo.ui.button(label="🔄 " + EQUITY["T"]("en", "refresh"), kind="neutral")
-    mo.hstack([lang_dd, refresh_btn], justify="space-between", align="center")
     return lang_dd, refresh_btn
 
 
@@ -926,11 +929,11 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
     _ = chat_go.value
     rf = route_filter.value
 
-    client = EQUITY["anthropic_client"]()
+    client = EQUITY["gemini_client"]()
     payload = EQUITY["metrics_payload"](bundle, metrics)
     narrator = ""
     if client:
-        narrator = EQUITY["claude_text"](
+        narrator = EQUITY["gemini_text"](
             client,
             system=(
                 "You are a transit equity analyst. Given live MBTA data, write a compelling 3-paragraph narrative briefing. "
@@ -947,7 +950,7 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
     anomaly = ""
     if client:
         rows = metrics.get("equity_df")
-        anomaly = EQUITY["claude_text"](
+        anomaly = EQUITY["gemini_text"](
             client,
             system="You are a data anomaly detector. Respond with exactly 3 bullet points.",
             user="Given these route metrics (JSON), identify biggest outlier, suspicious patterns, and a positive outlier.\n"
@@ -963,7 +966,7 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
     rag_context = "\n\n".join([f"[{c.get('source')}]: {c.get('text')}" for c in rag_chunks])
     promise_report = ""
     if client and rag_context:
-        promise_report = EQUITY["claude_text"](
+        promise_report = EQUITY["gemini_text"](
             client,
             system="You are a transit policy auditor. Compare promises to live outcomes. Be factual but firm.",
             user="MBTA DOCUMENTS:\n"
@@ -1153,29 +1156,16 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
 
     chat_out = ""
     if client and chat_in.value.strip():
-        try:
-            resp = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1200,
-                system=f"You are Ask the T. Cite numbers from CONTEXT JSON. Language={lang}.",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "CONTEXT:\n" + __json.dumps(payload, indent=2) + "\n\nQUESTION:\n" + chat_in.value,
-                    }
-                ],
-            )
-            parts: list[str] = []
-            for block in resp.content:
-                if getattr(block, "type", None) == "text":
-                    parts.append(block.text)
-            chat_out = "\n".join(parts).strip()
-        except Exception as e:  # pragma: no cover
-            chat_out = str(e)
+        chat_out = EQUITY["gemini_text"](
+            client,
+            system=f"You are Ask the T. Cite numbers from CONTEXT JSON. Language={lang}.",
+            user="CONTEXT:\n" + __json.dumps(payload, indent=2) + "\n\nQUESTION:\n" + chat_in.value,
+            max_tokens=1200,
+        )
 
     forecast = ""
     if client:
-        forecast = EQUITY["claude_text"](
+        forecast = EQUITY["gemini_text"](
             client,
             system="You are a forecaster. Short answer with confidence.",
             user="Given current MBTA summary JSON, predict next 30 minutes for Route 28 quality.\n" + __json.dumps(payload, indent=2),
@@ -1184,7 +1174,7 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
 
     meeting = ""
     if client:
-        meeting = EQUITY["claude_text"](
+        meeting = EQUITY["gemini_text"](
             client,
             system="Generate board meeting talking points with citations.",
             user="Summarize dashboard JSON + equity table JSON.\n"
@@ -1214,7 +1204,7 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
         if c < -0.25:
             corr_note = "**The data suggests a negative correlation between modeled neighborhood income proxies and reliability in this small sample — treat as exploratory.**"
 
-    mo.vstack(
+    output = mo.vstack(
         [
             rtl(f"# {__t('title')}"),
             rtl(f"### {__t('subtitle')}"),
@@ -1289,15 +1279,15 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
             mo.download(data=letter_bytes, filename="open-letter.html", label=__t("download_letter")),
             council_md,
             rtl("## " + __t("rag_title")),
-            mo.md(promise_report or "_Enable Claude for policy synthesis._"),
+            mo.md(promise_report or "_Enable Gemini (set GEMINI_API_KEY or GOOGLE_API_KEY in .env) for policy synthesis._"),
             rtl("## " + __t("anomaly_title")),
-            mo.md(anomaly or "_Enable Claude._"),
+            mo.md(anomaly or "_Enable Gemini (set GEMINI_API_KEY or GOOGLE_API_KEY in .env)._"),
             rtl("## " + __t("ask_title")),
             mo.hstack([chat_in, chat_go]),
             mo.md("```\n" + chat_out + "\n```") if chat_out else mo.md(""),
             rtl("## " + __t("smart_title")),
-            mo.callout(forecast or "_Enable Claude._", kind="neutral"),
-            mo.callout(meeting or "_Enable Claude._", kind="neutral"),
+            mo.callout(forecast or "_Enable Gemini (set GEMINI_API_KEY or GOOGLE_API_KEY in .env)._", kind="neutral"),
+            mo.callout(meeting or "_Enable Gemini (set GEMINI_API_KEY or GOOGLE_API_KEY in .env)._", kind="neutral"),
             mo.callout(title_vi, kind="danger") if title_vi else mo.md(""),
             mo.md(lg_note),
             mo.md(EQUITY["TRANSLATIONS"]["en"]["mcp_note"]),
@@ -1305,6 +1295,8 @@ def __(mo, EQUITY, bundle, metrics, lang_dd, route_filter, route_dd, stop_dd, ai
         ],
         gap=1,
     )
+    return output
+
 
 if __name__ == "__main__":
     app.run()
